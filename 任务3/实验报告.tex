@@ -1,0 +1,232 @@
+% !Mode:: "TeX:UTF-8"
+% !TEX program  = xelatex
+\documentclass{sdureport}
+
+\usepackage{ctex}
+\usepackage{indentfirst}
+\usepackage{amsmath}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{graphicx}
+
+\sduCollege{网络空间安全}
+\sduCourse{网络安全创新创业实践}
+\sduName{张涵/彭炜霖/李庭跃}
+\sduExperimentalTopics{任务3：对称密码算法的软件实现与优化}
+\sduExexperimentalHours{4h}
+\sduDate{2026年7月25日}
+
+\begin{document}
+\begin{sduDocument}
+	\section{实验目的：}
+	\begin{enumerate}
+		\renewcommand{\labelenumi}{(\theenumi)}
+		\item 从基本实现出发，掌握对称密码算法的底层软件执行效率优化，包含 T-table（查表法）以及最新指令集（AES-NI / Shuffle）的使用。
+		\item 基于底层引擎，完成 CTR 和 XTS 工作模式的软件并行优化实现。
+	\end{enumerate}
+	
+	\section{实验步骤：}
+
+	\subsection{实验内容：}
+	\begin{enumerate}
+		\renewcommand{\labelenumi}{(\theenumi)}
+		\item \textbf{底层查表优化设计}：编写 T-table 查表逻辑，将 SubBytes、ShiftRows 和 MixColumns 合并为 1KB 表查找。
+		\item \textbf{CTR 模式并行优化}：利用 \texttt{\_mm\_shuffle\_epi8} 解决 x86 架构的小端序与密码学大端序计数器之间的转换问题，实现一次性 4 个 Block 的并行加密。
+		\item \textbf{XTS 模式并行优化}：利用有限域 $GF(2^{128})$ 内乘以多项式 $x$ 的等价位移与条件异或操作，一次性生成 4 个 Tweak，送入 AES-NI 流水线。
+	\end{enumerate} 
+
+	\section{代码实现：}
+	\subsection{C语言优化实现代码 (task3.c)}
+	本代码实现了 AES-NI 硬件指令加速下的 CTR 与 XTS 模式并行计算，并使用 \texttt{\_\_rdtsc} 进行精准测速。
+	\begin{lstlisting}[language=c]
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <wmmintrin.h>  //AES-NI
+#include <tmmintrin.h>  //SSSE3 (Shuffle)
+#include <x86intrin.h>  //RDTSC
+
+#define BLOCK_SIZE 16
+#define TEST_SIZE (1024 * 1024 * 16) //16MB测试数据
+
+static inline __m128i aes_128_key_exp(__m128i key, __m128i keygened) {
+    keygened = _mm_shuffle_epi32(keygened, _MM_SHUFFLE(3, 3, 3, 3));
+    key = _mm_xor_si128(key, _mm_slli_si128(key, 4));
+    key = _mm_xor_si128(key, _mm_slli_si128(key, 4));
+    key = _mm_xor_si128(key, _mm_slli_si128(key, 4));
+    return _mm_xor_si128(key, keygened);
+}
+
+void aes128_load_key(uint8_t* enc_key, __m128i* key_schedule) {
+    key_schedule[0] = _mm_loadu_si128((const __m128i*) enc_key);
+    key_schedule[1] = aes_128_key_exp(key_schedule[0], _mm_aeskeygenassist_si128(key_schedule[0], 0x01));
+    key_schedule[2] = aes_128_key_exp(key_schedule[1], _mm_aeskeygenassist_si128(key_schedule[1], 0x02));
+    key_schedule[3] = aes_128_key_exp(key_schedule[2], _mm_aeskeygenassist_si128(key_schedule[2], 0x04));
+    key_schedule[4] = aes_128_key_exp(key_schedule[3], _mm_aeskeygenassist_si128(key_schedule[3], 0x08));
+    key_schedule[5] = aes_128_key_exp(key_schedule[4], _mm_aeskeygenassist_si128(key_schedule[4], 0x10));
+    key_schedule[6] = aes_128_key_exp(key_schedule[5], _mm_aeskeygenassist_si128(key_schedule[5], 0x20));
+    key_schedule[7] = aes_128_key_exp(key_schedule[6], _mm_aeskeygenassist_si128(key_schedule[6], 0x40));
+    key_schedule[8] = aes_128_key_exp(key_schedule[7], _mm_aeskeygenassist_si128(key_schedule[7], 0x80));
+    key_schedule[9] = aes_128_key_exp(key_schedule[8], _mm_aeskeygenassist_si128(key_schedule[8], 0x1B));
+    key_schedule[10] = aes_128_key_exp(key_schedule[9], _mm_aeskeygenassist_si128(key_schedule[9], 0x36));
+}
+
+//T-Table优化示意
+uint32_t T0[256], T1[256], T2[256], T3[256];
+void aes_round_ttable(uint32_t* state, const uint32_t* round_key) {
+    uint32_t t0 = state[0], t1 = state[1], t2 = state[2], t3 = state[3];
+    state[0] = T0[t0 >> 24] ^ T1[(t1 >> 16) & 0xFF] ^ T2[(t2 >> 8) & 0xFF] ^ T3[t3 & 0xFF] ^ round_key[0];
+    state[1] = T0[t1 >> 24] ^ T1[(t2 >> 16) & 0xFF] ^ T2[(t3 >> 8) & 0xFF] ^ T3[t0 & 0xFF] ^ round_key[1];
+    state[2] = T0[t2 >> 24] ^ T1[(t3 >> 16) & 0xFF] ^ T2[(t0 >> 8) & 0xFF] ^ T3[t1 & 0xFF] ^ round_key[2];
+    state[3] = T0[t3 >> 24] ^ T1[(t0 >> 16) & 0xFF] ^ T2[(t1 >> 8) & 0xFF] ^ T3[t2 & 0xFF] ^ round_key[3];
+}
+
+//CTR模式：结合AES-NI与Shuffle并行4块加密
+static const __m128i BSWAP_EPUB8 = { 0x0001020304050607, 0x08090A0B0C0D0E0F };
+
+void aes128_ctr_4blocks_ni(__m128i* pt, __m128i* ct, const __m128i* round_keys, __m128i* iv_counter) {
+    __m128i bswap_mask = _mm_loadu_si128((__m128i*) & BSWAP_EPUB8);
+    __m128i ctr0 = _mm_shuffle_epi8(*iv_counter, bswap_mask);
+
+    __m128i one = _mm_set_epi64x(0, 1);
+    __m128i ctr1 = _mm_add_epi64(ctr0, one);
+    __m128i ctr2 = _mm_add_epi64(ctr1, one);
+    __m128i ctr3 = _mm_add_epi64(ctr2, one);
+
+    __m128i block0 = _mm_shuffle_epi8(ctr0, bswap_mask);
+    __m128i block1 = _mm_shuffle_epi8(ctr1, bswap_mask);
+    __m128i block2 = _mm_shuffle_epi8(ctr2, bswap_mask);
+    __m128i block3 = _mm_shuffle_epi8(ctr3, bswap_mask);
+
+    block0 = _mm_xor_si128(block0, round_keys[0]);
+    block1 = _mm_xor_si128(block1, round_keys[0]);
+    block2 = _mm_xor_si128(block2, round_keys[0]);
+    block3 = _mm_xor_si128(block3, round_keys[0]);
+
+    for (int i = 1; i < 10; ++i) {
+        block0 = _mm_aesenc_si128(block0, round_keys[i]);
+        block1 = _mm_aesenc_si128(block1, round_keys[i]);
+        block2 = _mm_aesenc_si128(block2, round_keys[i]);
+        block3 = _mm_aesenc_si128(block3, round_keys[i]);
+    }
+
+    block0 = _mm_aesenclast_si128(block0, round_keys[10]);
+    block1 = _mm_aesenclast_si128(block1, round_keys[10]);
+    block2 = _mm_aesenclast_si128(block2, round_keys[10]);
+    block3 = _mm_aesenclast_si128(block3, round_keys[10]);
+
+    _mm_storeu_si128(&ct[0], _mm_xor_si128(block0, _mm_loadu_si128(&pt[0])));
+    _mm_storeu_si128(&ct[1], _mm_xor_si128(block1, _mm_loadu_si128(&pt[1])));
+    _mm_storeu_si128(&ct[2], _mm_xor_si128(block2, _mm_loadu_si128(&pt[2])));
+    _mm_storeu_si128(&ct[3], _mm_xor_si128(block3, _mm_loadu_si128(&pt[3])));
+
+    *iv_counter = _mm_shuffle_epi8(_mm_add_epi64(ctr3, one), bswap_mask);
+}
+
+//XTS模式：GF(2^128) Tweak 生成与并行加密
+
+static inline __m128i next_tweak(__m128i t) {
+    __m128i res, mask;
+    //获取最高位，判断是否溢出需要异或0x87
+    mask = _mm_srai_epi32(_mm_shuffle_epi32(t, _MM_SHUFFLE(3, 3, 3, 3)), 31);
+    mask = _mm_and_si128(mask, _mm_set_epi32(0, 0, 0, 0x87));
+
+    __m128i t_shifted = _mm_slli_epi64(t, 1);
+    __m128i t_carry = _mm_srli_epi64(_mm_slli_si128(t, 8), 63);
+    res = _mm_or_si128(t_shifted, t_carry);
+
+    return _mm_xor_si128(res, mask);
+}
+
+void aes128_xts_4blocks_ni(__m128i* pt, __m128i* ct, const __m128i* round_keys, __m128i* tweak) {
+    __m128i t0 = *tweak;
+    __m128i t1 = next_tweak(t0);
+    __m128i t2 = next_tweak(t1);
+    __m128i t3 = next_tweak(t2);
+
+    __m128i b0 = _mm_xor_si128(_mm_loadu_si128(&pt[0]), t0);
+    __m128i b1 = _mm_xor_si128(_mm_loadu_si128(&pt[1]), t1);
+    __m128i b2 = _mm_xor_si128(_mm_loadu_si128(&pt[2]), t2);
+    __m128i b3 = _mm_xor_si128(_mm_loadu_si128(&pt[3]), t3);
+
+    b0 = _mm_xor_si128(b0, round_keys[0]);
+    b1 = _mm_xor_si128(b1, round_keys[0]);
+    b2 = _mm_xor_si128(b2, round_keys[0]);
+    b3 = _mm_xor_si128(b3, round_keys[0]);
+
+    for (int i = 1; i < 10; ++i) {
+        b0 = _mm_aesenc_si128(b0, round_keys[i]);
+        b1 = _mm_aesenc_si128(b1, round_keys[i]);
+        b2 = _mm_aesenc_si128(b2, round_keys[i]);
+        b3 = _mm_aesenc_si128(b3, round_keys[i]);
+    }
+    b0 = _mm_aesenclast_si128(b0, round_keys[10]);
+    b1 = _mm_aesenclast_si128(b1, round_keys[10]);
+    b2 = _mm_aesenclast_si128(b2, round_keys[10]);
+    b3 = _mm_aesenclast_si128(b3, round_keys[10]);
+
+    _mm_storeu_si128(&ct[0], _mm_xor_si128(b0, t0));
+    _mm_storeu_si128(&ct[1], _mm_xor_si128(b1, t1));
+    _mm_storeu_si128(&ct[2], _mm_xor_si128(b2, t2));
+    _mm_storeu_si128(&ct[3], _mm_xor_si128(b3, t3));
+
+    *tweak = next_tweak(t3);
+}
+
+uint8_t data_in[TEST_SIZE] __attribute__((aligned(16)));
+uint8_t data_out[TEST_SIZE] __attribute__((aligned(16)));
+
+int main() {
+    printf("Starting AES Optimization Benchmark (Test Size: %d MB)...\n", TEST_SIZE / 1024 / 1024);
+
+    //初始化密钥
+    uint8_t key[16] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                       0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F };
+    __m128i round_keys[11];
+    aes128_load_key(key, round_keys);
+
+    __m128i iv = _mm_set_epi32(0, 0, 0, 0);
+    __m128i tweak = _mm_set_epi32(0, 0, 0, 1);
+
+    uint64_t start, end;
+    double cycles_per_byte;
+
+    //测试CTR并行模式
+    start = __rdtsc();
+    for (int i = 0; i < TEST_SIZE; i += 64) {
+        aes128_ctr_4blocks_ni((__m128i*)(data_in + i), (__m128i*)(data_out + i), round_keys, &iv);
+    }
+    end = __rdtsc();
+    cycles_per_byte = (double)(end - start) / TEST_SIZE;
+    printf("AES-128 CTR (4-Block Parallel): %.2f cpb\n", cycles_per_byte);
+
+    //测试XTS并行模式
+    start = __rdtsc();
+    for (int i = 0; i < TEST_SIZE; i += 64) {
+        aes128_xts_4blocks_ni((__m128i*)(data_in + i), (__m128i*)(data_out + i), round_keys, &tweak);
+    }
+    end = __rdtsc();
+    cycles_per_byte = (double)(end - start) / TEST_SIZE;
+    printf("AES-128 XTS (4-Block Parallel): %.2f cpb\n", cycles_per_byte);
+
+    system("pause");
+    return 0;
+}
+	\end{lstlisting} 
+
+	\section{结果输出分析：}
+	测试结果截图如下：
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{result.png}
+		\caption{实验结果截图}
+	\end{figure}
+	\subsection{性能结果分析与验证}
+	\begin{enumerate}
+		\renewcommand{\labelenumi}{(\theenumi)}
+		\item \textbf{整体性能表现极其优异}：相比于纯 C 语言无优化的 15$\sim$20 cpb，CTR (1.47 cpb) 与 XTS (0.40 cpb) 的性能均实现了数量级的提升。
+		\item \textbf{CTR与XTS速度差异深层分析}：实验数据表明XTS模式的吞吐量远高于CTR。其核心瓶颈在于：CTR模式中，为了处理密码学标准的大端序，每个Block均需频繁调用 \texttt{\_mm\_shuffle\_epi8} 进行端序翻转，以及执行64位的加法指令。而在XTS模式中，Tweak计算过程被巧妙地转换为了纯向量位移与掩码条件异或指令。在开启 \texttt{-O3} 级别优化后，编译器将无依赖的位移运算与底层AES加解密指令在CPU内部高度重合执行，近乎抵消了Tweak生成的开销，从而让cpb下降至0.40。
+	\end{enumerate}
+
+\end{sduDocument}
+\end{document}
